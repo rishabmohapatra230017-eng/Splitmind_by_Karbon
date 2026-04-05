@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 import { buildExpenseSplitAmounts, computeBalances } from '../domain/balance-engine.js';
-import { getDatabase, toCurrency } from '../database/sqlite.js';
+import { nextId, readStore, toCurrency, type ParticipantRecord, type SplitMethod, updateStore } from '../database/store.js';
 import { requireCurrentUserRow } from './session-service.js';
 
 const addParticipantSchema = z.object({
@@ -29,14 +29,6 @@ const createExpenseSchema = z.object({
 });
 
 const expenseMutationSchema = createExpenseSchema.superRefine((value, context) => {
-  if (value.participantIds.length === 0) {
-    context.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: 'Select at least one participant'
-    });
-    return;
-  }
-
   if (value.splitMethod === 'custom') {
     const splitMap = new Map(value.splits.map((split) => [split.participantId, split.amount ?? 0]));
     const total = value.participantIds.reduce((sum, participantId) => sum + (splitMap.get(participantId) ?? 0), 0);
@@ -60,143 +52,59 @@ const expenseMutationSchema = createExpenseSchema.superRefine((value, context) =
   }
 });
 
-type GroupRow = {
-  id: number;
-  name: string;
-  note: string;
-  created_at: string;
-  updated_at: string;
-};
-
-type ParticipantRow = {
-  id: number;
-  group_id: number;
-  user_id: number | null;
-  name: string;
-  color_token: string;
-  is_current_user: number;
-  created_at: string;
-};
-
-type ExpenseRow = {
-  id: number;
-  group_id: number;
-  description: string;
-  note: string;
-  amount_cents: number;
-  paid_by_participant_id: number;
-  split_method: 'equal' | 'custom' | 'percentage';
-  expense_date: string;
-  created_at: string;
-};
-
-type SplitRow = {
-  expense_id: number;
-  participant_id: number;
-  amount_cents: number;
-  percentage_basis_points: number | null;
-};
-
-function getGroupRow(groupId: number) {
-  const db = getDatabase();
+function getAccessibleGroup(groupId: number) {
+  const state = readStore();
   const currentUser = requireCurrentUserRow();
-  const group = db
-    .prepare(
-      `
-      SELECT id, name, note, created_at, updated_at
-      FROM groups
-      WHERE id = ?
-        AND EXISTS (
-          SELECT 1
-          FROM participants p
-          WHERE p.group_id = groups.id
-            AND p.user_id = ?
-        )
-      `
-    )
-    .get(groupId, currentUser.id) as GroupRow | undefined;
+  const participant = state.participants.find((entry) => entry.groupId === groupId && entry.userId === currentUser.id);
+  const group = state.groups.find((entry) => entry.id === groupId);
 
-  if (!group) {
+  if (!group || !participant) {
     throw new Error('Group not found');
   }
 
-  return group;
+  return { state, group, currentUser };
 }
 
-function getParticipants(groupId: number) {
-  const db = getDatabase();
-  return db
-    .prepare(
-      `
-      SELECT id, group_id, user_id, name, color_token, is_current_user, created_at
-      FROM participants
-      WHERE group_id = ?
-      ORDER BY is_current_user DESC, id ASC
-      `
-    )
-    .all(groupId) as ParticipantRow[];
+function getGroupParticipants(state: ReturnType<typeof readStore>, groupId: number) {
+  return state.participants
+    .filter((participant) => participant.groupId === groupId)
+    .sort((left, right) => Number(right.isCurrentUser) - Number(left.isCurrentUser) || left.id - right.id);
 }
 
-function getExpenses(groupId: number) {
-  const db = getDatabase();
-  return db
-    .prepare(
-      `
-      SELECT id, group_id, description, note, amount_cents, paid_by_participant_id, split_method, expense_date, created_at
-      FROM expenses
-      WHERE group_id = ?
-      ORDER BY expense_date DESC, id DESC
-      `
-    )
-    .all(groupId) as ExpenseRow[];
-}
-
-function getExpenseSplits(expenseIds: number[]) {
-  const db = getDatabase();
-  if (expenseIds.length === 0) {
-    return [] as SplitRow[];
-  }
-
-  const placeholders = expenseIds.map(() => '?').join(', ');
-  return db
-    .prepare(
-      `
-      SELECT expense_id, participant_id, amount_cents, percentage_basis_points
-      FROM expense_splits
-      WHERE expense_id IN (${placeholders})
-      ORDER BY expense_id ASC, id ASC
-      `
-    )
-    .all(...expenseIds) as SplitRow[];
+function getGroupExpenses(state: ReturnType<typeof readStore>, groupId: number) {
+  return state.expenses
+    .filter((expense) => expense.groupId === groupId)
+    .sort((left, right) => right.expenseDate.localeCompare(left.expenseDate) || right.id - left.id);
 }
 
 function buildGroupSummary(groupId: number) {
-  const currentUser = requireCurrentUserRow();
-  const group = getGroupRow(groupId);
-  const participants = getParticipants(groupId);
-  const expenses = getExpenses(groupId);
-  const splitRows = getExpenseSplits(expenses.map((expense) => expense.id));
-  const splitMap = new Map<number, SplitRow[]>();
+  const { state, group, currentUser } = getAccessibleGroup(groupId);
+  const participants = getGroupParticipants(state, groupId);
+  const expenses = getGroupExpenses(state, groupId);
+  const expenseIds = new Set(expenses.map((expense) => expense.id));
+  const splitMap = new Map<number, typeof state.expenseSplits>();
 
-  splitRows.forEach((split) => {
-    const current = splitMap.get(split.expense_id) ?? [];
-    current.push(split);
-    splitMap.set(split.expense_id, current);
-  });
+  state.expenseSplits
+    .filter((split) => expenseIds.has(split.expenseId))
+    .forEach((split) => {
+      const current = splitMap.get(split.expenseId) ?? [];
+      current.push(split);
+      splitMap.set(split.expenseId, current);
+    });
 
   const balanceResult = computeBalances(
     participants.map((participant) => ({
       id: participant.id,
       name: participant.name,
-      isCurrentUser: participant.user_id === currentUser.id
+      isCurrentUser: participant.userId === currentUser.id
     })),
     expenses.map((expense) => ({
       id: expense.id,
-      amountCents: expense.amount_cents,
-      paidByParticipantId: expense.paid_by_participant_id,
+      amountCents: expense.amountCents,
+      paidByParticipantId: expense.paidByParticipantId,
       splits: (splitMap.get(expense.id) ?? []).map((split) => ({
-        participantId: split.participant_id,
-        amountCents: split.amount_cents
+        participantId: split.participantId,
+        amountCents: split.amountCents
       }))
     }))
   );
@@ -208,8 +116,8 @@ function buildGroupSummary(groupId: number) {
       id: String(group.id),
       name: group.name,
       note: group.note,
-      createdAt: group.created_at,
-      updatedAt: group.updated_at,
+      createdAt: group.createdAt,
+      updatedAt: group.updatedAt,
       participantCount: participants.length,
       totalSpend: toCurrency(balanceResult.metrics.totalGroupSpendCents),
       youPaid: toCurrency(balanceResult.metrics.youPaidCents),
@@ -217,28 +125,28 @@ function buildGroupSummary(groupId: number) {
     },
     participants: participants.map((participant) => ({
       id: String(participant.id),
-      groupId: String(participant.group_id),
+      groupId: String(participant.groupId),
       name: participant.name,
-      colorToken: participant.color_token,
-      isCurrentUser: participant.user_id === currentUser.id,
-      createdAt: participant.created_at
+      colorToken: participant.colorToken,
+      isCurrentUser: participant.userId === currentUser.id,
+      createdAt: participant.createdAt
     })),
     expenses: expenses.map((expense) => ({
       id: String(expense.id),
-      groupId: String(expense.group_id),
+      groupId: String(expense.groupId),
       description: expense.description,
       note: expense.note,
-      amount: toCurrency(expense.amount_cents),
-      paidByParticipantId: String(expense.paid_by_participant_id),
-      paidByName: participantMap.get(expense.paid_by_participant_id)?.name ?? 'Unknown',
-      splitMethod: expense.split_method,
-      expenseDate: expense.expense_date,
-      createdAt: expense.created_at,
+      amount: toCurrency(expense.amountCents),
+      paidByParticipantId: String(expense.paidByParticipantId),
+      paidByName: participantMap.get(expense.paidByParticipantId)?.name ?? 'Unknown',
+      splitMethod: expense.splitMethod,
+      expenseDate: expense.expenseDate,
+      createdAt: expense.createdAt,
       splits: (splitMap.get(expense.id) ?? []).map((split) => ({
-        participantId: String(split.participant_id),
-        participantName: participantMap.get(split.participant_id)?.name ?? 'Unknown',
-        amount: toCurrency(split.amount_cents),
-        percentage: typeof split.percentage_basis_points === 'number' ? split.percentage_basis_points / 100 : undefined
+        participantId: String(split.participantId),
+        participantName: participantMap.get(split.participantId)?.name ?? 'Unknown',
+        amount: toCurrency(split.amountCents),
+        percentage: typeof split.percentageBasisPoints === 'number' ? split.percentageBasisPoints / 100 : undefined
       }))
     })),
     balances: balanceResult.balances.map((balance) => ({
@@ -264,272 +172,218 @@ function buildGroupSummary(groupId: number) {
   };
 }
 
+function ensureParticipantIdsBelong(participants: ParticipantRecord[], ids: number[]) {
+  const participantSet = new Set(participants.map((participant) => participant.id));
+  return ids.every((id) => participantSet.has(id));
+}
+
+function updateGroupTimestamp(state: ReturnType<typeof readStore>, groupId: number, timestamp: string) {
+  const group = state.groups.find((entry) => entry.id === groupId);
+  if (group) {
+    group.updatedAt = timestamp;
+  }
+}
+
 export function getGroupDetail(groupId: string) {
   return buildGroupSummary(Number(groupId));
 }
 
 export function addParticipant(groupId: string, payload: unknown) {
   const input = addParticipantSchema.parse(payload);
-  const db = getDatabase();
   const numericGroupId = Number(groupId);
 
-  getGroupRow(numericGroupId);
+  updateStore((state) => {
+    const currentUser = requireCurrentUserRow();
+    const currentMembership = state.participants.find(
+      (participant) => participant.groupId === numericGroupId && participant.userId === currentUser.id
+    );
+    if (!currentMembership) {
+      throw new Error('Group not found');
+    }
 
-  const currentCount = (db.prepare(`SELECT COUNT(*) as count FROM participants WHERE group_id = ?`).get(numericGroupId) as {
-    count: number;
-  }).count;
+    const currentCount = state.participants.filter((participant) => participant.groupId === numericGroupId).length;
+    if (currentCount >= 4) {
+      throw new Error('A group can contain at most 4 participants including you');
+    }
 
-  if (currentCount >= 4) {
-    throw new Error('A group can contain at most 4 participants including you');
-  }
-
-  db.prepare(
-    `
-    INSERT INTO participants (group_id, name, color_token, is_current_user, created_at)
-    VALUES (?, ?, ?, 0, ?)
-    `
-  ).run(numericGroupId, input.name, input.colorToken, new Date().toISOString());
-
-  db.prepare(`UPDATE groups SET updated_at = ? WHERE id = ?`).run(new Date().toISOString(), numericGroupId);
+    state.participants.push({
+      id: nextId(state, 'participants'),
+      groupId: numericGroupId,
+      userId: null,
+      name: input.name,
+      colorToken: input.colorToken,
+      isCurrentUser: false,
+      createdAt: new Date().toISOString()
+    });
+    updateGroupTimestamp(state, numericGroupId, new Date().toISOString());
+  });
 
   return buildGroupSummary(numericGroupId);
 }
 
 export function removeParticipant(groupId: string, participantId: string) {
-  const db = getDatabase();
   const numericGroupId = Number(groupId);
   const numericParticipantId = Number(participantId);
 
-  const participant = db
-    .prepare(
-      `
-      SELECT id, is_current_user
-      FROM participants
-      WHERE id = ? AND group_id = ?
-      `
-    )
-    .get(numericParticipantId, numericGroupId) as { id: number; is_current_user: number } | undefined;
+  updateStore((state) => {
+    const participant = state.participants.find(
+      (entry) => entry.id === numericParticipantId && entry.groupId === numericGroupId
+    );
+    if (!participant) {
+      throw new Error('Participant not found');
+    }
+    if (participant.isCurrentUser) {
+      throw new Error('The current user participant cannot be removed');
+    }
 
-  if (!participant) {
-    throw new Error('Participant not found');
-  }
+    const expenseIds = new Set(state.expenses.filter((expense) => expense.groupId === numericGroupId).map((expense) => expense.id));
+    const referenced = state.expenses.some(
+      (expense) => expense.groupId === numericGroupId && expense.paidByParticipantId === numericParticipantId
+    ) || state.expenseSplits.some(
+      (split) => expenseIds.has(split.expenseId) && split.participantId === numericParticipantId
+    );
 
-  if (participant.is_current_user === 1) {
-    throw new Error('The current user participant cannot be removed');
-  }
+    if (referenced) {
+      throw new Error('Remove related expenses before deleting this participant');
+    }
 
-  const referenced = (
-    db.prepare(
-      `
-      SELECT COUNT(*) as count
-      FROM expenses e
-      LEFT JOIN expense_splits es ON es.expense_id = e.id
-      WHERE e.group_id = ?
-        AND (e.paid_by_participant_id = ? OR es.participant_id = ?)
-      `
-    ).get(numericGroupId, numericParticipantId, numericParticipantId) as { count: number }
-  ).count;
-
-  if (referenced > 0) {
-    throw new Error('Remove related expenses before deleting this participant');
-  }
-
-  db.prepare(`DELETE FROM participants WHERE id = ? AND group_id = ?`).run(numericParticipantId, numericGroupId);
-  db.prepare(`UPDATE groups SET updated_at = ? WHERE id = ?`).run(new Date().toISOString(), numericGroupId);
+    state.participants = state.participants.filter((entry) => entry.id !== numericParticipantId);
+    updateGroupTimestamp(state, numericGroupId, new Date().toISOString());
+  });
 
   return buildGroupSummary(numericGroupId);
 }
 
-export function createExpense(groupId: string, payload: unknown) {
-  const input = expenseMutationSchema.parse(payload);
-  const db = getDatabase();
-  const numericGroupId = Number(groupId);
-  const participantIds = input.participantIds.map((id) => Number(id));
-  const payerId = Number(input.paidByParticipantId);
+function saveExpense(
+  state: ReturnType<typeof readStore>,
+  groupId: number,
+  expenseId: number | null,
+  payload: z.infer<typeof expenseMutationSchema>
+) {
+  const participants = getGroupParticipants(state, groupId);
+  const participantIds = payload.participantIds.map((id) => Number(id));
+  const payerId = Number(payload.paidByParticipantId);
 
-  getGroupRow(numericGroupId);
-
-  const participants = getParticipants(numericGroupId);
-  const participantSet = new Set(participants.map((participant) => participant.id));
-
-  if (!participantSet.has(payerId)) {
-    throw new Error('Selected payer is not part of this group');
-  }
-
-  if (participantIds.some((participantId) => !participantSet.has(participantId))) {
+  if (!ensureParticipantIdsBelong(participants, [...participantIds, payerId])) {
     throw new Error('All selected participants must belong to the same group');
   }
 
-  const splitPayload = new Map(input.splits.map((split) => [Number(split.participantId), split]));
+  const splitPayload = new Map(payload.splits.map((split) => [Number(split.participantId), split]));
   const splitAmounts = buildExpenseSplitAmounts({
-    totalCents: Math.round(input.amount * 100),
+    totalCents: Math.round(payload.amount * 100),
     participantIds,
-    splitMethod: input.splitMethod,
+    splitMethod: payload.splitMethod,
     customAmountsCents:
-      input.splitMethod === 'custom'
+      payload.splitMethod === 'custom'
         ? participantIds.map((participantId) => Math.round((splitPayload.get(participantId)?.amount ?? 0) * 100))
         : undefined,
     percentageBasisPoints:
-      input.splitMethod === 'percentage'
+      payload.splitMethod === 'percentage'
         ? participantIds.map((participantId) => Math.round((splitPayload.get(participantId)?.percentage ?? 0) * 100))
         : undefined
   });
 
   const now = new Date().toISOString();
-  const transaction = db.transaction(() => {
-    const expenseResult = db
-      .prepare(
-        `
-        INSERT INTO expenses (group_id, description, note, amount_cents, paid_by_participant_id, split_method, expense_date, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `
-      )
-      .run(
-        numericGroupId,
-        input.description,
-        input.note,
-        Math.round(input.amount * 100),
-        payerId,
-        input.splitMethod,
-        input.expenseDate,
-        now,
-        now
-      );
+  const resolvedExpenseId = expenseId ?? nextId(state, 'expenses');
 
-    const expenseId = Number(expenseResult.lastInsertRowid);
-    const insertSplit = db.prepare(
-      `
-      INSERT INTO expense_splits (expense_id, participant_id, amount_cents, percentage_basis_points)
-      VALUES (?, ?, ?, ?)
-      `
-    );
+  if (expenseId) {
+    const existingExpense = state.expenses.find((expense) => expense.id === expenseId && expense.groupId === groupId);
+    if (!existingExpense) {
+      throw new Error('Expense not found');
+    }
 
-    splitAmounts.forEach((split) => {
-      const original = splitPayload.get(split.participantId);
-      insertSplit.run(
-        expenseId,
-        split.participantId,
-        split.amountCents,
-        input.splitMethod === 'percentage' ? Math.round((original?.percentage ?? 0) * 100) : null
-      );
+    existingExpense.description = payload.description;
+    existingExpense.note = payload.note;
+    existingExpense.amountCents = Math.round(payload.amount * 100);
+    existingExpense.paidByParticipantId = payerId;
+    existingExpense.splitMethod = payload.splitMethod as SplitMethod;
+    existingExpense.expenseDate = payload.expenseDate;
+    existingExpense.updatedAt = now;
+    state.expenseSplits = state.expenseSplits.filter((split) => split.expenseId !== expenseId);
+  } else {
+    state.expenses.push({
+      id: resolvedExpenseId,
+      groupId,
+      description: payload.description,
+      note: payload.note,
+      amountCents: Math.round(payload.amount * 100),
+      paidByParticipantId: payerId,
+      splitMethod: payload.splitMethod as SplitMethod,
+      expenseDate: payload.expenseDate,
+      createdAt: now,
+      updatedAt: now
     });
+  }
 
-    db.prepare(`UPDATE groups SET updated_at = ? WHERE id = ?`).run(now, numericGroupId);
+  splitAmounts.forEach((split) => {
+    const original = splitPayload.get(split.participantId);
+    state.expenseSplits.push({
+      id: nextId(state, 'expenseSplits'),
+      expenseId: resolvedExpenseId,
+      participantId: split.participantId,
+      amountCents: split.amountCents,
+      percentageBasisPoints: payload.splitMethod === 'percentage' ? Math.round((original?.percentage ?? 0) * 100) : null
+    });
   });
 
-  transaction();
+  updateGroupTimestamp(state, groupId, now);
+}
+
+export function createExpense(groupId: string, payload: unknown) {
+  const input = expenseMutationSchema.parse(payload);
+  const numericGroupId = Number(groupId);
+
+  updateStore((state) => {
+    const currentUser = requireCurrentUserRow();
+    const membership = state.participants.find(
+      (participant) => participant.groupId === numericGroupId && participant.userId === currentUser.id
+    );
+    if (!membership) {
+      throw new Error('Group not found');
+    }
+
+    saveExpense(state, numericGroupId, null, input);
+  });
 
   return buildGroupSummary(numericGroupId);
 }
 
 export function updateExpense(groupId: string, expenseId: string, payload: unknown) {
   const input = expenseMutationSchema.parse(payload);
-  const db = getDatabase();
   const numericGroupId = Number(groupId);
   const numericExpenseId = Number(expenseId);
-  const participantIds = input.participantIds.map((id) => Number(id));
-  const payerId = Number(input.paidByParticipantId);
 
-  getGroupRow(numericGroupId);
-
-  const expense = db
-    .prepare(
-      `
-      SELECT id
-      FROM expenses
-      WHERE id = ? AND group_id = ?
-      `
-    )
-    .get(numericExpenseId, numericGroupId) as { id: number } | undefined;
-
-  if (!expense) {
-    throw new Error('Expense not found');
-  }
-
-  const participants = getParticipants(numericGroupId);
-  const participantSet = new Set(participants.map((participant) => participant.id));
-
-  if (!participantSet.has(payerId)) {
-    throw new Error('Selected payer is not part of this group');
-  }
-
-  if (participantIds.some((participantId) => !participantSet.has(participantId))) {
-    throw new Error('All selected participants must belong to the same group');
-  }
-
-  const splitPayload = new Map(input.splits.map((split) => [Number(split.participantId), split]));
-  const splitAmounts = buildExpenseSplitAmounts({
-    totalCents: Math.round(input.amount * 100),
-    participantIds,
-    splitMethod: input.splitMethod,
-    customAmountsCents:
-      input.splitMethod === 'custom'
-        ? participantIds.map((participantId) => Math.round((splitPayload.get(participantId)?.amount ?? 0) * 100))
-        : undefined,
-    percentageBasisPoints:
-      input.splitMethod === 'percentage'
-        ? participantIds.map((participantId) => Math.round((splitPayload.get(participantId)?.percentage ?? 0) * 100))
-        : undefined
-  });
-
-  const now = new Date().toISOString();
-  const transaction = db.transaction(() => {
-    db.prepare(
-      `
-      UPDATE expenses
-      SET description = ?, note = ?, amount_cents = ?, paid_by_participant_id = ?, split_method = ?, expense_date = ?, updated_at = ?
-      WHERE id = ? AND group_id = ?
-      `
-    ).run(
-      input.description,
-      input.note,
-      Math.round(input.amount * 100),
-      payerId,
-      input.splitMethod,
-      input.expenseDate,
-      now,
-      numericExpenseId,
-      numericGroupId
+  updateStore((state) => {
+    const currentUser = requireCurrentUserRow();
+    const membership = state.participants.find(
+      (participant) => participant.groupId === numericGroupId && participant.userId === currentUser.id
     );
+    if (!membership) {
+      throw new Error('Group not found');
+    }
 
-    db.prepare(`DELETE FROM expense_splits WHERE expense_id = ?`).run(numericExpenseId);
-
-    const insertSplit = db.prepare(
-      `
-      INSERT INTO expense_splits (expense_id, participant_id, amount_cents, percentage_basis_points)
-      VALUES (?, ?, ?, ?)
-      `
-    );
-
-    splitAmounts.forEach((split) => {
-      const original = splitPayload.get(split.participantId);
-      insertSplit.run(
-        numericExpenseId,
-        split.participantId,
-        split.amountCents,
-        input.splitMethod === 'percentage' ? Math.round((original?.percentage ?? 0) * 100) : null
-      );
-    });
-
-    db.prepare(`UPDATE groups SET updated_at = ? WHERE id = ?`).run(now, numericGroupId);
+    saveExpense(state, numericGroupId, numericExpenseId, input);
   });
-
-  transaction();
 
   return buildGroupSummary(numericGroupId);
 }
 
 export function deleteExpense(groupId: string, expenseId: string) {
-  const db = getDatabase();
   const numericGroupId = Number(groupId);
   const numericExpenseId = Number(expenseId);
 
-  const result = db.prepare(`DELETE FROM expenses WHERE id = ? AND group_id = ?`).run(numericExpenseId, numericGroupId);
-  if (result.changes === 0) {
-    throw new Error('Expense not found');
-  }
+  updateStore((state) => {
+    const existingExpense = state.expenses.find(
+      (expense) => expense.id === numericExpenseId && expense.groupId === numericGroupId
+    );
+    if (!existingExpense) {
+      throw new Error('Expense not found');
+    }
 
-  db.prepare(`UPDATE groups SET updated_at = ? WHERE id = ?`).run(new Date().toISOString(), numericGroupId);
+    state.expenses = state.expenses.filter((expense) => expense.id !== numericExpenseId);
+    state.expenseSplits = state.expenseSplits.filter((split) => split.expenseId !== numericExpenseId);
+    updateGroupTimestamp(state, numericGroupId, new Date().toISOString());
+  });
 
   return buildGroupSummary(numericGroupId);
 }

@@ -1,7 +1,7 @@
 import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 
-import { getDatabase } from '../database/sqlite.js';
+import { nextId, readStore, type StoreState, type UserRecord, updateStore } from '../database/store.js';
 
 const registerSchema = z.object({
   name: z.string().trim().min(2).max(48),
@@ -13,13 +13,6 @@ const loginSchema = z.object({
   email: z.string().trim().email().max(120),
   password: z.string().min(6).max(128)
 });
-
-type CurrentUserRow = {
-  id: number;
-  name: string;
-  email: string;
-  password_hash: string | null;
-};
 
 function hashPassword(password: string) {
   const salt = randomBytes(16).toString('hex');
@@ -39,21 +32,12 @@ function verifyPassword(password: string, storedHash: string) {
   return original.length === derived.length && timingSafeEqual(original, derived);
 }
 
-export function getCurrentUserRow(): CurrentUserRow | null {
-  const db = getDatabase();
-  const currentUser = db
-    .prepare(
-      `SELECT id, name, email, password_hash
-       FROM users
-       WHERE is_current_user = 1
-       LIMIT 1`
-    )
-    .get() as CurrentUserRow | undefined;
-
-  return currentUser ?? null;
+export function getCurrentUserRow(): UserRecord | null {
+  const state = readStore();
+  return state.users.find((user) => user.isCurrentUser) ?? null;
 }
 
-export function requireCurrentUserRow(): CurrentUserRow {
+export function requireCurrentUserRow(): UserRecord {
   const currentUser = getCurrentUserRow();
   if (!currentUser) {
     throw new Error('You need to log in first');
@@ -62,7 +46,7 @@ export function requireCurrentUserRow(): CurrentUserRow {
   return currentUser;
 }
 
-export function formatCurrentUser(currentUser: CurrentUserRow) {
+export function formatCurrentUser(currentUser: UserRecord) {
   return {
     id: String(currentUser.id),
     name: currentUser.name,
@@ -77,20 +61,17 @@ export function formatCurrentUser(currentUser: CurrentUserRow) {
   };
 }
 
-function seedWorkspaceForUser(userId: number, name: string) {
-  const db = getDatabase();
-  const existingGroup = db
-    .prepare(
-      `
-      SELECT g.id
-      FROM groups g
-      INNER JOIN participants p ON p.group_id = g.id
-      WHERE p.user_id = ?
-      LIMIT 1
-      `
-    )
-    .get(userId) as { id: number } | undefined;
+function clearCurrentSession(state: StoreState) {
+  state.users.forEach((user) => {
+    user.isCurrentUser = false;
+  });
+  state.participants.forEach((participant) => {
+    participant.isCurrentUser = false;
+  });
+}
 
+function seedWorkspaceForUser(state: StoreState, userId: number, name: string) {
+  const existingGroup = state.participants.find((participant) => participant.userId === userId);
   if (existingGroup) {
     return;
   }
@@ -133,158 +114,147 @@ function seedWorkspaceForUser(userId: number, name: string) {
   ];
   const template = starterTemplates[userId % starterTemplates.length];
 
-  const transaction = db.transaction(() => {
-    const groupResult = db
-      .prepare(
-        `
-        INSERT INTO groups (name, note, owner_user_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?)
-        `
-      )
-      .run(
-        template.groupName,
-        template.note,
-        userId,
-        now,
-        now
-      );
-
-    const groupId = Number(groupResult.lastInsertRowid);
-
-    const insertParticipant = db.prepare(
-      `
-      INSERT INTO participants (group_id, user_id, name, color_token, is_current_user, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-      `
-    );
-
-    const currentParticipant = insertParticipant.run(groupId, userId, name, 'indigo', 1, now);
-    const friendOne = insertParticipant.run(groupId, null, template.expense.friends[0], 'emerald', 0, now);
-    const friendTwo = insertParticipant.run(groupId, null, template.expense.friends[1], 'amber', 0, now);
-
-    const expenseResult = db
-      .prepare(
-        `
-        INSERT INTO expenses (group_id, description, note, amount_cents, paid_by_participant_id, split_method, expense_date, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `
-      )
-      .run(
-        groupId,
-        template.expense.description,
-        template.expense.note,
-        template.expense.amountCents,
-        Number(currentParticipant.lastInsertRowid),
-        'equal',
-        template.expense.expenseDate,
-        now,
-        now
-      );
-
-    const expenseId = Number(expenseResult.lastInsertRowid);
-    const equalShare = Math.floor(template.expense.amountCents / 3);
-    const insertSplit = db.prepare(
-      `
-      INSERT INTO expense_splits (expense_id, participant_id, amount_cents, percentage_basis_points)
-      VALUES (?, ?, ?, ?)
-      `
-    );
-
-    insertSplit.run(expenseId, Number(currentParticipant.lastInsertRowid), equalShare, null);
-    insertSplit.run(expenseId, Number(friendOne.lastInsertRowid), equalShare, null);
-    insertSplit.run(
-      expenseId,
-      Number(friendTwo.lastInsertRowid),
-      template.expense.amountCents - equalShare - equalShare,
-      null
-    );
+  const groupId = nextId(state, 'groups');
+  state.groups.push({
+    id: groupId,
+    name: template.groupName,
+    note: template.note,
+    ownerUserId: userId,
+    createdAt: now,
+    updatedAt: now
   });
 
-  transaction();
+  const currentParticipantId = nextId(state, 'participants');
+  const friendOneId = nextId(state, 'participants');
+  const friendTwoId = nextId(state, 'participants');
+
+  state.participants.push({
+    id: currentParticipantId,
+    groupId,
+    userId,
+    name,
+    colorToken: 'indigo',
+    isCurrentUser: true,
+    createdAt: now
+  });
+  state.participants.push({
+    id: friendOneId,
+    groupId,
+    userId: null,
+    name: template.expense.friends[0],
+    colorToken: 'emerald',
+    isCurrentUser: false,
+    createdAt: now
+  });
+  state.participants.push({
+    id: friendTwoId,
+    groupId,
+    userId: null,
+    name: template.expense.friends[1],
+    colorToken: 'amber',
+    isCurrentUser: false,
+    createdAt: now
+  });
+
+  const expenseId = nextId(state, 'expenses');
+  state.expenses.push({
+    id: expenseId,
+    groupId,
+    description: template.expense.description,
+    note: template.expense.note,
+    amountCents: template.expense.amountCents,
+    paidByParticipantId: currentParticipantId,
+    splitMethod: 'equal',
+    expenseDate: template.expense.expenseDate,
+    createdAt: now,
+    updatedAt: now
+  });
+
+  const equalShare = Math.floor(template.expense.amountCents / 3);
+  state.expenseSplits.push({
+    id: nextId(state, 'expenseSplits'),
+    expenseId,
+    participantId: currentParticipantId,
+    amountCents: equalShare,
+    percentageBasisPoints: null
+  });
+  state.expenseSplits.push({
+    id: nextId(state, 'expenseSplits'),
+    expenseId,
+    participantId: friendOneId,
+    amountCents: equalShare,
+    percentageBasisPoints: null
+  });
+  state.expenseSplits.push({
+    id: nextId(state, 'expenseSplits'),
+    expenseId,
+    participantId: friendTwoId,
+    amountCents: template.expense.amountCents - equalShare - equalShare,
+    percentageBasisPoints: null
+  });
 }
 
 export function register(payload: unknown) {
   const input = registerSchema.parse(payload);
-  const db = getDatabase();
-  const now = new Date().toISOString();
   const email = input.email.toLowerCase();
 
-  const existingUser = db.prepare(`SELECT id FROM users WHERE email = ?`).get(email) as { id: number } | undefined;
-  if (existingUser) {
-    throw new Error('An account with this email already exists');
-  }
+  return formatCurrentUser(
+    updateStore((state) => {
+      if (state.users.some((user) => user.email === email)) {
+        throw new Error('An account with this email already exists');
+      }
 
-  const transaction = db.transaction(() => {
-    db.prepare(`UPDATE users SET is_current_user = 0`).run();
-    db.prepare(`UPDATE participants SET is_current_user = 0`).run();
+      clearCurrentSession(state);
 
-    db.prepare(
-      `
-      INSERT INTO users (name, email, password_hash, is_current_user, created_at)
-      VALUES (?, ?, ?, 1, ?)
-      `
-    ).run(input.name, email, hashPassword(input.password), now);
+      const currentUser: UserRecord = {
+        id: nextId(state, 'users'),
+        name: input.name,
+        email,
+        passwordHash: hashPassword(input.password),
+        isCurrentUser: true,
+        createdAt: new Date().toISOString()
+      };
 
-    const currentUser = requireCurrentUserRow();
-    seedWorkspaceForUser(currentUser.id, currentUser.name);
-    db.prepare(`UPDATE participants SET is_current_user = 1 WHERE user_id = ?`).run(currentUser.id);
+      state.users.push(currentUser);
+      seedWorkspaceForUser(state, currentUser.id, currentUser.name);
 
-    return currentUser;
-  });
-
-  return formatCurrentUser(transaction());
+      return currentUser;
+    })
+  );
 }
 
 export function login(payload: unknown) {
   const input = loginSchema.parse(payload);
-  const db = getDatabase();
   const email = input.email.toLowerCase();
-  const existingUser = db
-    .prepare(`SELECT id, name, email, password_hash FROM users WHERE email = ?`)
-    .get(email) as CurrentUserRow | undefined;
 
-  if (!existingUser || !existingUser.password_hash) {
-    throw new Error('No account exists for this email');
-  }
+  return formatCurrentUser(
+    updateStore((state) => {
+      const existingUser = state.users.find((user) => user.email === email);
+      if (!existingUser || !existingUser.passwordHash) {
+        throw new Error('No account exists for this email');
+      }
 
-  if (!verifyPassword(input.password, existingUser.password_hash)) {
-    throw new Error('Incorrect password');
-  }
+      if (!verifyPassword(input.password, existingUser.passwordHash)) {
+        throw new Error('Incorrect password');
+      }
 
-  const transaction = db.transaction(() => {
-    db.prepare(`UPDATE users SET is_current_user = 0`).run();
-    db.prepare(`UPDATE participants SET is_current_user = 0`).run();
+      clearCurrentSession(state);
+      existingUser.isCurrentUser = true;
+      state.participants.forEach((participant) => {
+        if (participant.userId === existingUser.id) {
+          participant.name = existingUser.name;
+          participant.isCurrentUser = true;
+        }
+      });
+      seedWorkspaceForUser(state, existingUser.id, existingUser.name);
 
-    db.prepare(`UPDATE users SET is_current_user = 1 WHERE id = ?`).run(existingUser.id);
-
-    const currentUser = requireCurrentUserRow();
-
-    db.prepare(
-      `
-      UPDATE participants
-      SET name = ?
-      WHERE user_id = ?
-      `
-    ).run(currentUser.name, currentUser.id);
-
-    db.prepare(
-      `
-      UPDATE participants
-      SET is_current_user = 1
-      WHERE user_id = ?
-      `
-    ).run(currentUser.id);
-
-    seedWorkspaceForUser(currentUser.id, currentUser.name);
-
-    return currentUser;
-  });
-
-  return formatCurrentUser(transaction());
+      return existingUser;
+    })
+  );
 }
 
 export function logout() {
-  const db = getDatabase();
-  db.prepare(`UPDATE users SET is_current_user = 0`).run();
-  db.prepare(`UPDATE participants SET is_current_user = 0`).run();
+  updateStore((state) => {
+    clearCurrentSession(state);
+  });
 }

@@ -1,40 +1,47 @@
-import { getDatabase, initializeDatabase } from './sqlite.js';
+import { initializeStore, readStore, resetStore } from './store.js';
 
 export function seedDatabase() {
-  initializeDatabase();
-  const db = getDatabase();
-  db.prepare(`UPDATE users SET is_current_user = 0`).run();
-  db.prepare(`UPDATE participants SET is_current_user = 0`).run();
+  initializeStore();
+  const state = readStore();
+  state.users.forEach((user) => {
+    user.isCurrentUser = false;
+  });
+  state.participants.forEach((participant) => {
+    participant.isCurrentUser = false;
+  });
+  resetStore(state);
 }
 
 export function resetSeedData() {
-  initializeDatabase();
-  const db = getDatabase();
-  const currentUser = db.prepare(`SELECT name, email FROM users WHERE is_current_user = 1 LIMIT 1`).get() as
-    | { name: string; email: string }
-    | undefined;
+  initializeStore();
+  const state = readStore();
+  const currentUser = state.users.find((user) => user.isCurrentUser) ?? null;
 
-  db.exec(`
-    DELETE FROM expense_splits;
-    DELETE FROM expenses;
-    DELETE FROM participants;
-    DELETE FROM groups;
-    DELETE FROM users;
-    DELETE FROM sqlite_sequence WHERE name IN ('users', 'groups', 'participants', 'expenses', 'expense_splits');
-  `);
-
-  if (currentUser) {
-    db.prepare(
-      `
-      INSERT INTO users (name, email, is_current_user, created_at)
-      VALUES (?, ?, 1, ?)
-      `
-    ).run(currentUser.name, currentUser.email, new Date().toISOString());
-    return;
-  }
+  resetStore({
+    counters: {
+      users: currentUser ? 1 : 0,
+      groups: 0,
+      participants: 0,
+      expenses: 0,
+      expenseSplits: 0
+    },
+    users: currentUser
+      ? [
+          {
+            ...currentUser,
+            id: 1,
+            isCurrentUser: true
+          }
+        ]
+      : [],
+    groups: [],
+    participants: [],
+    expenses: [],
+    expenseSplits: []
+  });
 }
 
 if (process.argv[1]?.endsWith('seed.ts')) {
   seedDatabase();
-  console.log('Prepared SplitMint database with no active user session');
+  console.log('Prepared SplitMint store with no active user session');
 }
