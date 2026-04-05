@@ -1,0 +1,5 @@
+
+> equishare-backend@1.0.0 dev
+> tsx watch src/server.ts
+
+EquiShare API running on http://localhost:3001
