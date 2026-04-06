@@ -2,14 +2,13 @@ import cors from 'cors';
 import express from 'express';
 
 import { initializeStore } from './database/store.js';
-import { resetSeedData, seedDatabase } from './database/seed.js';
+import { resetSeedData } from './database/seed.js';
 import { equiShareSchemaSql } from './database/schema.js';
 import groupsRouter from './routes/groups.js';
 import { getCurrentUser } from './services/groups-service.js';
 import { getCurrentUserRow, login, logout, register } from './services/session-service.js';
 
 initializeStore();
-seedDatabase();
 
 const app = express();
 

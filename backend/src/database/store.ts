@@ -70,7 +70,7 @@ export interface StoreState {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const dataDirectory = path.resolve(__dirname, '../../data');
+const dataDirectory = process.env.VERCEL ? path.join('/tmp', 'equishare-data') : path.resolve(__dirname, '../../data');
 const storePath = path.join(dataDirectory, 'equishare-store.json');
 
 function createEmptyStore(): StoreState {

@@ -119,3 +119,4 @@ Error: Current user seed record is missing
     at C:\Users\risha\OneDrive\Desktop\SplitMint-main (2)\SplitMint-main\backend\node_modules\express\lib\router\index.js:284:15
     at Function.process_params (C:\Users\risha\OneDrive\Desktop\SplitMint-main (2)\SplitMint-main\backend\node_modules\express\lib\router\index.js:346:12)
     at next (C:\Users\risha\OneDrive\Desktop\SplitMint-main (2)\SplitMint-main\backend\node_modules\express\lib\router\index.js:280:10)
+^C
